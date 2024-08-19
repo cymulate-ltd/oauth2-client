@@ -22,7 +22,7 @@ Below are examples of how to use the `CymulateOAuth2Client` class to authenticat
 
 ```python
 import json
-from dummy.cymulate.cymulate_oauth2_client import CymulateOAuth2Client
+from cymulate_oauth2_client import CymulateOAuth2Client
 from requests.exceptions import HTTPError
 
 def main():
@@ -67,7 +67,7 @@ For environments that support asynchronous programming, you can use the asynchro
 ```python
 import json
 import asyncio
-from dummy.cymulate.cymulate_oauth2_client import CymulateOAuth2Client
+from cymulate_oauth2_client import CymulateOAuth2Client
 from requests.exceptions import HTTPError
 
 async def async_main():
