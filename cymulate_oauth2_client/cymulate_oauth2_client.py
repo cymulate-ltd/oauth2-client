@@ -4,14 +4,17 @@ import logging
 import re
 import atexit
 import threading
-from requests.exceptions import RequestException, HTTPError, ConnectionError, Timeout
+import aiohttp
+import asyncio
+from requests.exceptions import RequestException, HTTPError
 from urllib.parse import urlparse
-from typing import Optional, Dict, Any, final, Self, Union
+from typing import Optional, Dict, Any, final, Union, Self
 from tenacity import retry, stop_after_attempt, wait_fixed
+from .api_paths import GETPaths, POSTPaths, PUTPaths, DELETEPaths
+from .cymulate_decorators import synchronized, log_exceptions, retry_on_failure
 
 JsonResponse = Dict[str, Any]
 Headers = Optional[Dict[str, str]]
-
 
 @final
 class CymulateOAuth2Client:
@@ -39,41 +42,34 @@ class CymulateOAuth2Client:
         self._register_exit_handler()
 
     def _initialize_credentials(self, client_id: str, client_secret: str, base_url: str, scope: Optional[str]) -> None:
-        """Initialize client credentials and related parameters."""
         self.client_id: str = client_id
         self.client_secret: str = client_secret
         self.base_url: str = base_url.rstrip('/')
         self.scope: Optional[str] = scope
 
     def _initialize_retry_settings(self, max_retries: int, retry_delay: int) -> None:
-        """Initialize retry settings."""
         self.max_retries: int = max_retries
         self.retry_delay: int = retry_delay
 
     def _initialize_token_urls(self, base_url: str) -> None:
-        """Initialize token and revoke URLs."""
         self.token_url: str = f"{self.base_url}/oauth2/token"
         self.revoke_url: str = f"{self.base_url}/oauth2/revoke"
 
     def _initialize_tokens(self) -> None:
-        """Initialize token-related variables."""
         self.access_token: Optional[str] = None
         self.refresh_token: Optional[str] = None
         self.token_expires_at: float = 0.0
         self.tokens_revoked: bool = False
 
     def _setup_logging(self) -> None:
-        """Setup logging configuration."""
         logging.basicConfig(level=logging.INFO)
         self.logger = logging.getLogger(__name__)
 
     def _register_exit_handler(self) -> None:
-        """Register the token revocation handler to be called on exit."""
         atexit.register(self._revoke_tokens_on_exit)
 
     @staticmethod
     def _validate_client_id(client_id: str) -> None:
-        """Validate that the client_id is a valid MongoDB ObjectId using a regex."""
         if not re.fullmatch(r"^[a-fA-F0-9]{24}$", client_id):
             raise ValueError(
                 f"Invalid client_id: {client_id}. Must be a valid 24-character hexadecimal MongoDB ObjectId."
@@ -81,53 +77,39 @@ class CymulateOAuth2Client:
 
     @staticmethod
     def _validate_base_url(base_url: str) -> None:
-        """Validate that the base_url is a well-formed URL."""
         parsed_url = urlparse(base_url)
         if not all([parsed_url.scheme, parsed_url.netloc]):
             raise ValueError(f"Invalid base_url: {base_url}. Must be a valid URL.")
 
-    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2))
     def _make_request(self, url: str, data: JsonResponse, headers: Headers = None) -> JsonResponse:
-        """Utility method to make a POST request with retries."""
         headers = headers or {}
         response = requests.post(url, data=data, headers=headers)
         response.raise_for_status()
         return response.json()
 
-    def _perform_request(self, method: str, url: str, headers: Headers, **kwargs: Any) -> requests.Response:
-        """Internal method to perform an HTTP request and handle retries."""
-        for attempt in range(self.max_retries):
-            try:
-                response = requests.request(method, url, headers=headers, **kwargs)
+    async def _make_async_request(self, url: str, data: JsonResponse, headers: Headers = None) -> JsonResponse:
+        headers = headers or {}
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=data, headers=headers) as response:
                 response.raise_for_status()
-                return response
-            except (HTTPError, ConnectionError, Timeout) as e:
-                self.logger.warning(f"{type(e).__name__} on attempt {attempt + 1}: {str(e)}")
-                if isinstance(e, HTTPError) and response.status_code == 401:
-                    raise
-                if attempt < self.max_retries - 1:
-                    time.sleep(self.retry_delay)
-                else:
-                    raise
+                return await response.json()
 
-    def _get_new_tokens(self) -> None:
-        """Obtain new tokens from the OAuth2 server."""
-        self.logger.info("Obtaining new access token...")
-        data = {
-            'grant_type': 'client_credentials',
-            'client_id': self.client_id,
-            'client_secret': self.client_secret,
-            'audience': self.AUDIENCE,
-            'issuer': self.ISSUER,
-        }
-        if self.scope:
-            data['scope'] = self.scope
+    @synchronized(threading.Lock())
+    def _ensure_valid_token(self) -> None:
+        if self.access_token is None or time.time() >= self.token_expires_at - 30:
+            if self.refresh_token:
+                self._refresh_access_token()
+            else:
+                self._get_new_tokens()
 
-        response_data = self._make_request(self.token_url, data)
-        self._set_tokens(response_data)
+    async def _ensure_valid_token_async(self) -> None:
+        if self.access_token is None or time.time() >= self.token_expires_at - 30:
+            if self.refresh_token:
+                await self._refresh_async_access_token()
+            else:
+                await self._get_new_async_tokens()
 
     def _refresh_access_token(self) -> Self:
-        """Refresh the access token using the refresh token."""
         if not self.refresh_token:
             self.logger.info("No refresh token available. Obtaining new tokens.")
             self._get_new_tokens()
@@ -150,31 +132,75 @@ class CymulateOAuth2Client:
 
         return self
 
-    @final
+    async def _refresh_async_access_token(self) -> Self:
+        if not self.refresh_token:
+            self.logger.info("No refresh token available. Obtaining new tokens (async).")
+            await self._get_new_async_tokens()
+            return self
+
+        self.logger.info("Refreshing access token (async)...")
+        data = {
+            'grant_type': 'refresh_token',
+            'refresh_token': self.refresh_token,
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+        }
+
+        try:
+            response_data = await self._make_async_request(self.token_url, data)
+            self._set_tokens(response_data)
+        except RequestException:
+            self.logger.warning("Failed to refresh token (async), obtaining new tokens.")
+            await self._get_new_async_tokens()
+
+        return self
+
+    def _get_new_tokens(self) -> None:
+        """Obtain new tokens synchronously from the OAuth2 server."""
+        self.logger.info("Obtaining new access token...")
+        data = {
+            'grant_type': 'client_credentials',
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+            'audience': self.AUDIENCE,
+            'issuer': self.ISSUER,
+        }
+        if self.scope:
+            data['scope'] = self.scope
+
+        response_data = self._make_request(self.token_url, data)
+        self._set_tokens(response_data)
+
+    async def _get_new_async_tokens(self) -> None:
+        """Obtain new tokens asynchronously from the OAuth2 server."""
+        self.logger.info("Obtaining new access token (async)...")
+        data = {
+            'grant_type': 'client_credentials',
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+            'audience': self.AUDIENCE,
+            'issuer': self.ISSUER,
+        }
+        if self.scope:
+            data['scope'] = self.scope
+
+        response_data = await self._make_async_request(self.token_url, data)
+        self._set_tokens(response_data)
+
     def _set_tokens(self, response_data: Dict[str, Any]) -> None:
-        """Set the access and refresh tokens from the response."""
         self.access_token = response_data.get('access_token')
         self.refresh_token = response_data.get('refresh_token')
         self.token_expires_at = time.time() + response_data.get('expires_in', 3600)
         self.logger.info("Access token set successfully. Token expires at {}".format(time.ctime(self.token_expires_at)))
 
-    def _ensure_valid_token(self) -> None:
-        """Ensure the access token is valid, refreshing or obtaining new tokens if necessary."""
-        with self.token_lock:
-            if self.access_token is None or time.time() >= self.token_expires_at - 30:
-                if self.refresh_token:
-                    self._refresh_access_token()
-                else:
-                    self._get_new_tokens()
-
     def _prepare_headers(self, headers: Headers) -> Dict[str, str]:
-        """Prepare headers with Authorization token."""
         headers = headers or {}
         headers['Authorization'] = f'Bearer {self.access_token}'
         return headers
 
+    @log_exceptions(logging.getLogger(__name__))
+    @retry_on_failure(max_retries=3, delay=2)
     def request(self, method: str, url: str, **kwargs: Any) -> Dict[str, Any]:
-        """Make an authenticated request to a secure resource."""
         self._ensure_valid_token()
         headers = self._prepare_headers(kwargs.pop('headers', {}))
         response = self._perform_request(method, url, headers, **kwargs)
@@ -186,25 +212,85 @@ class CymulateOAuth2Client:
         response.raise_for_status()
         return response.json()
 
-    def get(self, path: str, **kwargs: Any) -> Dict[str, Any]:
-        """GET request to a secure resource."""
+    @log_exceptions(logging.getLogger(__name__))
+    @retry(stop=stop_after_attempt(3), wait=wait_fixed(2), reraise=True)
+    async def async_request(self, method: str, url: str, **kwargs: Any) -> Dict[str, Any]:
+        await self._ensure_valid_token_async()
+        headers = self._prepare_headers(kwargs.pop('headers', {}))
+
+        async with aiohttp.ClientSession() as session:
+            async with session.request(method, url, headers=headers, **kwargs) as response:
+                response.raise_for_status()
+                if response.status == 401:
+                    self.logger.info("Unauthorized (async). Refreshing token and retrying request.")
+                    await self._refresh_async_access_token()
+                    headers['Authorization'] = f'Bearer {self.access_token}'
+                    async with session.request(method, url, headers=headers, **kwargs) as response:
+                        response.raise_for_status()
+                        return await response.json()
+                return await response.json()
+
+    def _perform_request(self, method: str, url: str, headers: Headers, **kwargs: Any) -> requests.Response:
+        """Internal method to perform a synchronous HTTP request and handle retries."""
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.request(method, url, headers=headers, **kwargs)
+                response.raise_for_status()
+                return response
+            except requests.exceptions.RequestException as e:
+                self.logger.warning(f"{type(e).__name__} on attempt {attempt + 1}: {str(e)}")
+                if isinstance(e, HTTPError) and e.response is not None and e.response.status_code == 401:
+                    raise
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay)
+                else:
+                    raise
+
+    async def _perform_async_request(self, method: str, url: str, headers: Headers, **kwargs: Any) -> aiohttp.ClientResponse:
+        """Internal method to perform an async HTTP request and handle retries."""
+        for attempt in range(self.max_retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.request(method, url, headers=headers, **kwargs) as response:
+                        response.raise_for_status()
+                        return response
+            except (aiohttp.ClientError, aiohttp.ClientResponseError) as e:
+                self.logger.warning(f"{type(e).__name__} on attempt {attempt + 1}: {str(e)}")
+                if isinstance(e, aiohttp.ClientResponseError) and e.status == 401:
+                    raise
+                if attempt < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay)
+                else:
+                    raise
+
+    async def aget(self, path: Union[str, GETPaths], **kwargs: Any) -> Dict[str, Any]:
+        return await self.async_request('GET', f"{self.base_url}{path}", **kwargs)
+
+    def get(self, path: Union[str, GETPaths], **kwargs: Any) -> Dict[str, Any]:
         return self.request('GET', f"{self.base_url}{path}", **kwargs)
 
-    def post(self, path: str, data: Optional[Dict[str, Any]] = None, json: Optional[Dict[str, Any]] = None,
+    async def apost(self, path: Union[str, POSTPaths], data: Optional[Dict[str, Any]] = None, json: Optional[Dict[str, Any]] = None,
+                    **kwargs: Any) -> Dict[str, Any]:
+        return await self.async_request('POST', f"{self.base_url}{path}", data=data, json=json, **kwargs)
+
+    def post(self, path: Union[str, POSTPaths], data: Optional[Dict[str, Any]] = None, json: Optional[Dict[str, Any]] = None,
              **kwargs: Any) -> Dict[str, Any]:
-        """POST request to a secure resource."""
         return self.request('POST', f"{self.base_url}{path}", data=data, json=json, **kwargs)
 
-    def put(self, path: str, data: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
-        """PUT request to a secure resource."""
+    async def aput(self, path: Union[str, PUTPaths], data: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
+        return await self.async_request('PUT', f"{self.base_url}{path}", data=data, **kwargs)
+
+    def put(self, path: Union[str, PUTPaths], data: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
         return self.request('PUT', f"{self.base_url}{path}", data=data, **kwargs)
 
-    def delete(self, path: str, **kwargs: Any) -> Dict[str, Any]:
-        """DELETE request to a secure resource."""
+    async def adelete(self, path: Union[str, DELETEPaths], **kwargs: Any) -> Dict[str, Any]:
+        return await self.async_request('DELETE', f"{self.base_url}{path}", **kwargs)
+
+    def delete(self, path: Union[str, DELETEPaths], **kwargs: Any) -> Dict[str, Any]:
         return self.request('DELETE', f"{self.base_url}{path}", **kwargs)
 
+    @log_exceptions(logging.getLogger(__name__))
     def revoke_token(self, token: Optional[str] = None, token_type_hint: str = 'access_token') -> None:
-        """Revoke a token on the server."""
         if self.tokens_revoked:
             self.logger.info("Tokens already revoked, skipping further revocation.")
             return
@@ -237,7 +323,6 @@ class CymulateOAuth2Client:
             self.logger.error(f"Failed to revoke {token_type_hint}: {str(e)}")
 
     def _clear_tokens(self, token: str, token_type_hint: str) -> None:
-        """Clear the access or refresh token if revoked."""
         if token_type_hint == 'access_token':
             self.access_token = None
         elif token_type_hint == 'refresh_token':
@@ -245,8 +330,8 @@ class CymulateOAuth2Client:
         self.token_expires_at = 0
         self.logger.info(f"{token_type_hint.capitalize()} revoked and cleared successfully.")
 
+    @log_exceptions(logging.getLogger(__name__))
     def _revoke_tokens_on_exit(self) -> None:
-        """Revoke tokens when the program exits."""
         if not self.tokens_revoked:
             if self.refresh_token:
                 self.logger.info("Revoking refresh_token on script exit...")
