@@ -16,41 +16,94 @@ pip install cymulate-oauth2-client
 
 ## Usage
 
-Below is an example of how to use the `CymulateOAuth2Client` class to authenticate with the Cymulate API, make secure requests, and manage tokens.
+Below are examples of how to use the `CymulateOAuth2Client` class to authenticate with the Cymulate API, make secure requests, and manage tokens. Both synchronous and asynchronous examples are provided.
+
+### Synchronous Example
 
 ```python
-from cymulate_oauth2_client import CymulateOAuth2Client
-from typing import Dict, Any
+import json
+from dummy.cymulate.cymulate_oauth2_client import CymulateOAuth2Client
+from requests.exceptions import HTTPError
 
-def main() -> None:
-    """
-    Initialize the Cymulate OAuth2 client and demonstrate making
-    authenticated API requests to secure endpoints.
-    """
-    
-    # Instantiate the OAuth2 client with your Cymulate credentials and API base URL
-    client: CymulateOAuth2Client = CymulateOAuth2Client(
+def main():
+    # Initialize the OAuth2 client with your credentials and base URL
+    client = CymulateOAuth2Client(
         client_id='your_client_id',         # Your Cymulate OAuth2 client_id
         client_secret='your_client_secret', # Your Cymulate OAuth2 client_secret
         base_url='https://api.cymulate.com' # The Cymulate API base URL (adjust based on your region)
     )
 
     try:
-        # Example 1: Perform a GET request to a secure endpoint
-        response: Dict[str, Any] = client.get('/secure-endpoint')
-        print("GET response:", response)
+        # Example 1: Make a GET request to a secure resource
+        response = client.get(path='/v1/browsing/templates')
+        print("GET response:", json.dumps(response, indent=2))
 
-        # Example 2: Perform a POST request to a secure endpoint
-        # Uncomment the lines below to send a POST request
+        # Example 2: Make a POST request to a secure resource
         # data = {'key': 'value'}
-        # response = client.post('/secure-endpoint', json=data)
-        # print("POST response:", response)
+        # response = client.post(path='/msfinding/api/v2/filters', json=data)
+        # print("POST response:", json.dumps(response, indent=2))
 
+    except HTTPError as e:
+        # Handle HTTP errors separately
+        try:
+            error_message = e.response.json()
+        except ValueError:
+            # Response is not JSON formatted
+            error_message = e.response.text
+        print(f"HTTP error occurred: {e}")
+        print(f"Response content: {json.dumps(error_message, indent=2)}")
     except Exception as e:
-        print(f"An error occurred while making the request: {str(e)}")
+        # Handle all other exceptions
+        print(f"An error occurred: {str(e)}")
 
 if __name__ == "__main__":
     main()
+```
+
+### Asynchronous Example
+
+For environments that support asynchronous programming, you can use the asynchronous methods provided by `CymulateOAuth2Client`.
+
+```python
+import json
+import asyncio
+from dummy.cymulate.cymulate_oauth2_client import CymulateOAuth2Client
+from requests.exceptions import HTTPError
+
+async def async_main():
+    # Initialize the OAuth2 client with your credentials and base URL
+    client = CymulateOAuth2Client(
+        client_id='your_client_id',         # Your Cymulate OAuth2 client_id
+        client_secret='your_client_secret', # Your Cymulate OAuth2 client_secret
+        base_url='https://api.cymulate.com' # The Cymulate API base URL (adjust based on your region)
+    )
+
+    try:
+        # Example 1: Make a GET request to a secure resource asynchronously
+        async_response = await client.aget(path='/v1/browsing/templates')
+        print("Async GET response:", json.dumps(async_response, indent=2))
+
+        # Example 2: Make a POST request to a secure resource asynchronously
+        # async_data = {'key': 'value'}
+        # async_response = await client.apost(path='/msfinding/api/v2/filters', json=async_data)
+        # print("Async POST response:", json.dumps(async_response, indent=2))
+
+    except HTTPError as e:
+        # Handle HTTP errors separately
+        try:
+            error_message = e.response.json()
+        except ValueError:
+            # Response is not JSON formatted
+            error_message = e.response.text
+        print(f"HTTP error occurred: {e}")
+        print(f"Response content: {json.dumps(error_message, indent=2)}")
+    except Exception as e:
+        # Handle all other exceptions
+        print(f"An error occurred: {str(e)}")
+
+if __name__ == "__main__":
+    # Run asynchronous example
+    asyncio.run(async_main())
 ```
 
 ### API URL Configuration
@@ -71,6 +124,10 @@ For detailed API documentation, refer to the appropriate link based on your regi
 - `post(url, data=None, json=None, **kwargs)`: Sends a POST request to a secure resource.
 - `put(url, data=None, **kwargs)`: Sends a PUT request to a secure resource.
 - `delete(url, **kwargs)`: Sends a DELETE request to a secure resource.
+- `aget(url, **kwargs)`: Asynchronously sends a GET request.
+- `apost(url, data=None, json=None, **kwargs)`: Asynchronously sends a POST request.
+- `aput(url, data=None, **kwargs)`: Asynchronously sends a PUT request.
+- `adelete(url, **kwargs)`: Asynchronously sends a DELETE request.
 
 ### Exception Handling
 
